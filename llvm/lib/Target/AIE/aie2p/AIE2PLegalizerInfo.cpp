@@ -16,8 +16,11 @@
 #include "AIE2PLegalizerInfo.h"
 #include "AIE2PSubtarget.h"
 #include "llvm/CodeGen/GlobalISel/GenericMachineInstrs.h"
+#include "llvm/CodeGen/GlobalISel/LegalizerHelper.h"
 #include "llvm/CodeGen/GlobalISel/LegalizerInfo.h"
+#include "llvm/CodeGen/GlobalISel/MachineIRBuilder.h"
 #include "llvm/CodeGen/TargetOpcodes.h"
+#include "llvm/IR/IntrinsicsAIE2P.h"
 #include "llvm/Support/MathExtras.h"
 
 using namespace llvm;
@@ -481,6 +484,13 @@ AIE2PLegalizerInfo::AIE2PLegalizerInfo(const AIE2PSubtarget &ST)
   getActionDefinitionsBuilder({G_STACKSAVE, G_STACKRESTORE}).lower();
 
   getActionDefinitionsBuilder({G_SMIN, G_SMAX, G_UMIN, G_UMAX})
+      // 512-bit vectors are one VMAX_LT / VMIN_GE; wider ones are split into
+      // 512-bit halves first. Lowering them instead gives icmp + select on a
+      // vector of s1, which register bank selection cannot place.
+      .customFor({V16S32, V32S16, V64S8})
+      .clampMaxNumElements(0, S8, 64)
+      .clampMaxNumElements(0, S16, 32)
+      .clampMaxNumElements(0, S32, 16)
       .widenScalarToNextPow2(0, 32)
       .lower();
 
@@ -824,12 +834,57 @@ AIE2PLegalizerInfo::AIE2PLegalizerInfo(const AIE2PSubtarget &ST)
   verify(*ST.getInstrInfo());
 }
 
+// A 512-bit vector min/max as VMAX_LT (max, and the a < b mask) or VMIN_GE
+// (min, and the a >= b mask), the sign operand choosing signed or unsigned
+// compare. The mask result is unused.
+static bool legalizeVectorMinMax(LegalizerHelper &Helper, MachineInstr &MI) {
+  MachineIRBuilder &B = Helper.MIRBuilder;
+  MachineRegisterInfo &MRI = *B.getMRI();
+  const Register Dst = MI.getOperand(0).getReg();
+  const LLT Ty = MRI.getType(Dst);
+  const unsigned Opc = MI.getOpcode();
+  const bool IsMax = Opc == TargetOpcode::G_SMAX || Opc == TargetOpcode::G_UMAX;
+  const bool IsSigned =
+      Opc == TargetOpcode::G_SMAX || Opc == TargetOpcode::G_SMIN;
+  Intrinsic::ID ID;
+  LLT MaskTy = LLT::scalar(32);
+  switch (Ty.getScalarSizeInBits()) {
+  case 8:
+    ID = IsMax ? Intrinsic::aie2p_vmax_lt8 : Intrinsic::aie2p_vmin_ge8;
+    MaskTy = LLT::fixed_vector(2, 32);
+    break;
+  case 16:
+    ID = IsMax ? Intrinsic::aie2p_vmax_lt16 : Intrinsic::aie2p_vmin_ge16;
+    break;
+  case 32:
+    ID = IsMax ? Intrinsic::aie2p_vmax_lt32 : Intrinsic::aie2p_vmin_ge32;
+    break;
+  default:
+    return false;
+  }
+  const Register Mask = MRI.createGenericVirtualRegister(MaskTy);
+  const Register Sign =
+      B.buildConstant(LLT::scalar(32), IsSigned ? 1 : 0).getReg(0);
+  const Register Results[] = {Dst, Mask};
+  B.buildIntrinsic(ID, ArrayRef<Register>(Results), false, false)
+      .addUse(MI.getOperand(1).getReg())
+      .addUse(MI.getOperand(2).getReg())
+      .addUse(Sign);
+  MI.eraseFromParent();
+  return true;
+}
+
 bool AIE2PLegalizerInfo::legalizeCustom(
     LegalizerHelper &Helper, MachineInstr &MI,
     LostDebugLocObserver &LocObserver) const {
   switch (MI.getOpcode()) {
   default:
     break;
+  case TargetOpcode::G_SMAX:
+  case TargetOpcode::G_SMIN:
+  case TargetOpcode::G_UMAX:
+  case TargetOpcode::G_UMIN:
+    return legalizeVectorMinMax(Helper, MI);
   case TargetOpcode::G_STORE:
     return AIEHelper.legalize_G_STORE(Helper, cast<GStore>(MI));
   case TargetOpcode::G_VASTART:
